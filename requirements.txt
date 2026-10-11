@@ -1,0 +1,8 @@
+torch
+numpy
+pandas
+sentence-transformers
+vector-quantize-pytorch
+transformers
+accelerate
+wandb

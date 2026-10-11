@@ -1,0 +1,15 @@
+# data and artefacts -- never committed
+*.npz
+*.pt
+*.pt.arch.json
+*.tsv
+*.pkl
+wandb/
+__pycache__/
+*.pyc
+
+# processed data is distributed separately (see data/README.md)
+/data/
+__pycache__/
+/outputs/
+slurm-*.out

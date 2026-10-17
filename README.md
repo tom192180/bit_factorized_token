@@ -92,3 +92,8 @@ To evaluate the DocID encoder or the unmerged retriever as well:
 
 Evaluation: 8 trees, beam 100. Documents that share a DocID are scored by the expected value
 of the metric over a random order within the group.
+
+## License
+
+The code is released under the MIT License (see `LICENSE`). The datasets keep their own
+licenses; see `docs/DATA.md` for where each one comes from.

@@ -5,8 +5,8 @@
 #
 # Optional environment:
 #   BITS=120  NLEV=12        DocID length in bits, and bits per token
-#   SBERT=bert-base-uncased  backbone; for T5 use SBERT=t5-base OPT=adafactor LR=1e-3
-#   OPT=adamw  LR=2e-5       DocID encoder optimizer and learning rate
+#   SBERT=bert-base-uncased  backbone, or t5-base (both trainers then use Adafactor, see the
+#                            config.py of each stage)
 #   MAXLEN=128               input length in tokens
 #   OUT=<dir>                run folder; default outputs/<dataset>/<setting>/<run name>
 #   ENCODER=<.pt> DOCIDS=<.npz>   use an existing DocID encoder and DocID table (read only)
@@ -41,8 +41,6 @@ BITS=${BITS:-120}
 NLEV=${NLEV:-12}
 [ $((BITS % NLEV)) -eq 0 ] || { echo "FATAL: BITS $BITS is not a multiple of NLEV $NLEV" >&2; exit 1; }
 SBERT=${SBERT:-bert-base-uncased}
-OPT=${OPT:-adamw}
-LR=${LR:-2e-5}
 MAXLEN=${MAXLEN:-128}
 
 # Per-dataset defaults = the paper's settings.

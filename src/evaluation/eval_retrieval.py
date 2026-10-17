@@ -221,7 +221,7 @@ def main():
           f"{int((gcnt > 1).sum()):,} groups (max {int(gcnt.max())})", flush=True)
 
     with torch.no_grad():
-        Z = torch.cat([model(texts[i:i + a.bs], prompt_name="query")[1].float()
+        Z = torch.cat([model(texts[i:i + a.bs])[1].float()
                        for i in range(0, len(texts), a.bs)])
 
     @torch.no_grad()

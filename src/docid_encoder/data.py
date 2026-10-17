@@ -1,9 +1,10 @@
-"""Training data for the DocID encoder (and the pseudo-query selection the retriever reuses).
+"""Training data for the DocID encoder, plus the pseudo-query selection used by the retriever.
 
-Everything is read through corpus.py from the repository's data/ folder.
+Everything is read through corpus.py from the repository's data/ folder. The DocID encoder
+trains on real queries only; select_pseudo_queries is here because the retriever imports it.
 
     select_pseudo_queries(dataset, n, seed)   the seeded n generated queries per document
-    load_query_doc_pairs(...)                 NQ320K, full-corpus setting
+    load_query_doc_pairs()                    NQ320K, full-corpus setting
     load_trivia_pairs(...)                    TriviaQA, full-corpus setting
 
 The seen/unseen split runs do not use the two full-corpus loaders: the trainers read a split
@@ -45,14 +46,12 @@ def select_pseudo_queries(dataset, n_per_doc, seed=42):
     return out
 
 
-def load_trivia_pairs(splits=("train", "dev"), qg_per_doc=0, qg_seed=42):
+def load_trivia_pairs(splits=("train", "dev")):
     """TriviaQA, full-corpus setting -> (pairs_by_split, n_unique_docs, extra_docs).
 
     A pair is (query_text, doc_text, doc_id); doc_id is the document's position in the corpus,
     shared by all splits. One (query, gold) becomes one pair: train has one gold per row with
     the query repeated, dev and test list several golds per query.
-
-    qg_per_doc > 0 appends that many generated queries per document to TRAIN only.
 
     extra_docs is the TEXT of every corpus document that no returned split points at. The
     trainer adds them to the validation pool and nowhere else, so a validation query competes
@@ -61,45 +60,25 @@ def load_trivia_pairs(splits=("train", "dev"), qg_per_doc=0, qg_seed=42):
     if isinstance(splits, str):
         splits = (splits,)
     ids, texts = doc_ids_texts("trivia")
-    doc_id_of = {d: i for i, d in enumerate(ids)}
     out = {}
     for sp in splits:
         out[sp] = [(q, texts[i], i) for q, i in load_queries("trivia", sp, ids)]
         print(f"  trivia {sp}: {len(out[sp]):,} pairs")
-    n_real_train = len(out.get("train", []))   # everything after this is GENERATED
-    if qg_per_doc and "train" in out:
-        chosen = select_pseudo_queries("trivia", qg_per_doc, qg_seed)
-        n_before = len(out["train"])
-        for did in sorted(chosen):              # sorted: reproducible independent of dict order
-            if did not in doc_id_of:
-                continue
-            i = doc_id_of[did]
-            for q in chosen[did]:
-                out["train"].append((q, texts[i], i))
-        n_aug = len({d for _, _, d in out["train"][n_before:]})
-        print(f"  trivia qg augmentation: +{len(out['train'])-n_before:,} generated queries "
-              f"({qg_per_doc}/doc, seed {qg_seed}) over {n_aug:,} docs "
-              f"-> {len(out['train']):,} train pairs")
     seen = {d for _, _, d in out.get("train", [])} | {d for _, _, d in out.get("dev", [])}
     extra_docs = [texts[i] for i in range(len(ids)) if i not in seen]
     print(f"  trivia corpus: {len(ids):,} docs "
           f"({len(seen):,} judged by these splits + {len(extra_docs):,} pool-only)")
-    out["_n_real_train"] = n_real_train
     return out, len(ids), extra_docs
 
 
-def load_query_doc_pairs(qg_per_doc=0, qg_seed=42):
-    """NQ320K, full-corpus setting -> (pairs, n_docs, pool_only, val_rows, n_real, dev_rows).
+def load_query_doc_pairs():
+    """NQ320K, full-corpus setting -> (pairs, n_docs, extra_docs, dev_rows).
 
-    pairs     one (query_text, doc_text, doc_id) per train query, in train-file order. doc_id
-              is a running index in order of first appearance (NOT the corpus position).
-    n_real    pairs[:n_real] are real queries; the rest are generated.
-    n_docs    all 109,739 documents: those without a train query get a doc_id at the end.
-    dev_rows  the dev queries in the same triple form; the trainer validates on them.
-    pool_only, val_rows   always empty; kept so the trainer's unpacking is unchanged.
-
-    qg_per_doc > 0 appends that many generated queries per document for ALL 109,739 documents,
-    including the 1,713 with no real train query, which receive a doc_id at that point.
+    pairs      one (query_text, doc_text, doc_id) per train query, in train-file order. doc_id
+               is a running index in order of first appearance (NOT the corpus position).
+    n_docs     all 109,739 documents: those without a train query get a doc_id at the end.
+    extra_docs always empty: every document is reached through a train or dev query.
+    dev_rows   the dev queries in the same triple form; the trainer validates on them.
     """
     ids, texts = doc_ids_texts("nq320k")
     key_to_id, id_to_text = {}, {}
@@ -111,26 +90,6 @@ def load_query_doc_pairs(qg_per_doc=0, qg_seed=42):
             id_to_text[key_to_id[key]] = texts[i]
         doc_id = key_to_id[key]
         pairs.append((q_text, id_to_text[doc_id], doc_id))
-    n_real = len(pairs)     # everything after this index is GENERATED
-
-    if qg_per_doc:
-        text_of = dict(zip(ids, texts))
-        chosen = select_pseudo_queries("nq320k", qg_per_doc, qg_seed)
-        n_before, n_new_docs = len(pairs), 0
-        for key in sorted(chosen):              # ALL documents -- see the docstring
-            body = id_to_text.get(key_to_id[key]) if key in key_to_id else text_of.get(key)
-            if not body:
-                continue
-            if key not in key_to_id:            # a doc with no real query: give it an id now
-                key_to_id[key] = len(key_to_id)
-                id_to_text[key_to_id[key]] = body
-                n_new_docs += 1
-            doc_id = key_to_id[key]
-            for q in chosen[key]:
-                pairs.append((q, id_to_text[doc_id], doc_id))
-        print(f"  qg augmentation: +{len(pairs)-n_before:,} generated queries "
-              f"({qg_per_doc}/doc, seed {qg_seed}) -> {len(pairs):,} pairs, "
-              f"{len(key_to_id):,} docs (+{n_new_docs:,} that had no real query)")
 
     # Every corpus document gets a doc_id, including the 1,713 that only dev queries point to.
     # They are numbered in order of first appearance in the dev file.
@@ -145,7 +104,7 @@ def load_query_doc_pairs(qg_per_doc=0, qg_seed=42):
         if ids[i] in key_to_id:
             di = key_to_id[ids[i]]
             dev_rows.append((q_text, id_to_text[di], di))
-    return pairs, len(key_to_id), [], [], n_real, dev_rows
+    return pairs, len(key_to_id), [], dev_rows
 
 
 class QueryDocPairDataset(Dataset):

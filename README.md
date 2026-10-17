@@ -69,7 +69,7 @@ root. Results are written to `outputs/<dataset>/<setting>/<backbone>_b<bits>t<bi
 T5-base instead of BERT-base:
 
 ```bash
-export SBERT=t5-base OPT=adafactor LR=1e-3 S2_OPT=adafactor LR_ENC=1e-3
+export SBERT=t5-base
 ```
 
 Other DocID lengths: `BITS=84` or `BITS=252` (with `NLEV=12` bits per token).

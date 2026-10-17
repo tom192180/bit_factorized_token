@@ -36,8 +36,7 @@ def load_encoder(ckpt, sbert_model, max_seq_length):
         raise SystemExit(f"--sbert_model {sbert_model} contradicts the sidecar's "
                          f"{arch['sbert_model']}; drop the flag and let the sidecar decide")
     print(f"  arch: level={arch['level']} n_levels={arch.get('n_levels')} "
-          f"proj_dim={arch['proj_dim']} sbert={sbert_model}  "
-          f"({arch.get('run_name')})")
+          f"proj_dim={arch['proj_dim']} sbert={sbert_model}")
     if arch["level"] != 2:
         raise SystemExit(f"{side} says level={arch['level']}; the encoder emits ONE BIT per "
                          f"dimension, so only level 2 exists. That checkpoint is retired.")

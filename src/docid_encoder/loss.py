@@ -115,7 +115,7 @@ def cached_compute_loss(model, accelerator, query_batch, doc_batch, doc_ids,
             zc2_parts.append(model(dc)[1])
         for _, qc in _chunks(query_batch, mini_batch_size):
             rng_states.append(_get_rng_state(device))
-            zc1_parts.append(model(qc, prompt_name="query")[1])
+            zc1_parts.append(model(qc)[1])
 
     zc1 = torch.cat(zc1_parts, dim=0)
     zc2 = torch.cat(zc2_parts, dim=0)
@@ -151,7 +151,7 @@ def cached_compute_loss(model, accelerator, query_batch, doc_batch, doc_ids,
         ctx = nullcontext() if k == len(steps) - 1 else accelerator.no_sync(model)
         with ctx:
             if kind == "q":
-                zc_c = model(chunk, prompt_name="query")[1]
+                zc_c = model(chunk)[1]
                 gzc = gzc1
             else:
                 zc_c = model(chunk)[1]

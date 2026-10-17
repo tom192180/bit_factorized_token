@@ -20,11 +20,9 @@ def ensure_normalize(st: SentenceTransformer) -> SentenceTransformer:
 class Encoder_bit(nn.Module):
     def __init__(
         self,
-        sbert_model: str = "Qwen/Qwen3-Embedding-0.6B",
+        sbert_model: str = "bert-base-uncased",
         max_seq_length: int = 256,
         proj_dim: int | None = None,
-        query_prompt: str | None = None,
-        doc_prompt: str | None = None,
     ):
         """proj_dim is the DocID length k in bits; None uses the backbone's hidden size."""
         super().__init__()
@@ -33,9 +31,6 @@ class Encoder_bit(nn.Module):
                                          model_kwargs={"torch_dtype": torch.float32})
         ensure_normalize(self.sbert)
 
-        # Text prefixes for queries and documents (empty for BERT and T5).
-        self.query_prompt, self.doc_prompt = self._resolve_prompts(
-            sbert_model, query_prompt, doc_prompt)
         # Maximum input length in tokens, for queries and documents.
         self.sbert.max_seq_length = max_seq_length
 
@@ -64,35 +59,16 @@ class Encoder_bit(nn.Module):
         # LayerNorm over the k projected values (skipped when there is no projection).
         self.ln = nn.Identity() if self.proj_dim is None else nn.LayerNorm(self.code_dim)
 
-    def _resolve_prompts(self, sbert_model, query_prompt, doc_prompt):
-        """(query_prompt, doc_prompt) prefix strings for this backbone."""
-        if query_prompt is not None or doc_prompt is not None:
-            return query_prompt or "", doc_prompt or ""
-        name = sbert_model.lower()
-        if "e5" in name:  # E5 was trained with these exact prefixes
-            return "query: ", "passage: "
-        # Otherwise use the model's own prompts, if it has any.
-        prompts = getattr(self.sbert, "prompts", {}) or {}
-        return prompts.get("query", ""), prompts.get("document", "")
-
     def trainable_parameter_summary(self):
         """(trainable, total) parameter counts."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return trainable, total
 
-    def gradient_checkpointing_enable(self):
-        """Trade recompute for activation memory in the backbone."""
-        self.sbert._first_module().auto_model.gradient_checkpointing_enable()
-
-    def forward(self, sentences, prompt_name=None):
-        """sentences: list of str. prompt_name="query" marks queries.
+    def forward(self, sentences):
+        """sentences: list of str (queries and documents are encoded the same way).
 
         Returns (x, z_cont, bits): the embedding, the k values in (-1, 1), and the k bits."""
-        prefix = self.query_prompt if prompt_name == "query" else self.doc_prompt
-        if prefix:
-            sentences = [prefix + s for s in sentences]
-
         features = self.sbert.tokenize(sentences)
         # Move tensor features to the model's device; leave non-tensor entries as they are.
         device = next(self.sbert.parameters()).device

@@ -25,12 +25,11 @@ from corpus import doc_ids_texts, load_queries, DATASETS                # noqa: 
 
 
 @torch.no_grad()
-def encode(model, texts, bs, device, is_query, n_levels, want_x=True):
+def encode(model, texts, bs, device, n_levels, want_x=True):
     """(X, Z, C) for `texts`; X is None when want_x is False."""
-    prompt = "query" if is_query else None
     X, Z, C = [], [], []
     for i in range(0, len(texts), bs):
-        x, z, bits = model(texts[i:i + bs], prompt_name=prompt)
+        x, z, bits = model(texts[i:i + bs])
         idx = pack_bits(bits, n_levels)
         if want_x:
             X.append(x.float().cpu().numpy())
@@ -67,7 +66,7 @@ def main():
     # DOCUMENTS.
     ids, texts = doc_ids_texts(a.dataset)
     print(f"DOCS [{a.dataset}]: {len(ids):,} documents")
-    dX, dZ, dC = encode(model, texts, a.batch_size, device, False, n_levels, with_x)
+    dX, dZ, dC = encode(model, texts, a.batch_size, device, n_levels, with_x)
 
     # QUERIES.
     if split == "none":
@@ -81,7 +80,7 @@ def main():
         id2i = {d: i for i, d in enumerate(ids)}
         pairs = load_queries(a.dataset, split, ids)
         print(f"QUERIES [{split}]: {len(pairs):,} with a gold document in the corpus")
-        qX, qZ, qC = encode(model, [t for t, _ in pairs], a.batch_size, device, True,
+        qX, qZ, qC = encode(model, [t for t, _ in pairs], a.batch_size, device,
                             n_levels, with_x)
         gold = np.array([g for _, g in pairs], dtype=np.int64)
 

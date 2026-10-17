@@ -24,13 +24,10 @@ def _shard(seq, rank, world):
 
 
 def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
-                doc_chunk=DOC_CHUNK, accelerator=None, level=None, n_levels=None,
-                prefix_bits=None):
+                doc_chunk=DOC_CHUNK, accelerator=None, level=None, n_levels=None):
     """Rank all doc_texts for each query and return a dict of metrics.
 
-    true_doc_idx[i] is the index in doc_texts of query i's document. prefix_bits lists bit
-    widths for which the ranking is repeated on the first B bits only."""
-    prefix_bits = tuple(prefix_bits or ())
+    true_doc_idx[i] is the index in doc_texts of query i's document."""
     model.eval()
     # Use bf16 autocast, as training does.
     amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -83,9 +80,6 @@ def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
         true_overlaps, rand_overlaps = [], []
         rr_exp, mrr10_exp, recall1_exp, recall10_exp, tied_counts = [], [], [], [], []
         pd_rr, pd_mrr10, pd_recall1, pd_recall10, pd_tied = [], [], [], [], []
-        # Metrics on the first B bits.
-        px_rr = {pb: [] for pb in prefix_bits}
-        px_tied = {pb: [] for pb in prefix_bits}
         # Encode and score the queries, each GPU its share.
         n_queries_true = len(queries)
         my_queries, _ = _shard(queries, proc_rank, world)
@@ -93,7 +87,7 @@ def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
         for i in range(0, len(my_queries), batch_size):
             q_batch = my_queries[i : i + batch_size]
             true_idx = torch.tensor(my_true_idx[i : i + batch_size], device=device)
-            q_x, _, q_bits = model(q_batch, prompt_name="query")
+            q_x, _, q_bits = model(q_batch)
             q_idx = (pack_bits(q_bits, n_levels).to(torch.int32) if n_levels
                      else torch.zeros(len(q_bits), 0, dtype=torch.int32, device=q_bits.device))
             q_emb = F.normalize(q_x.float(), dim=-1).to(emb_dtype)
@@ -116,12 +110,6 @@ def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
                 true_pd = (q_lv == doc_levels[true_idx]).sum(dim=-1)
                 better_pd = torch.zeros(b, dtype=torch.long, device=device)
                 tied_pd = torch.zeros(b, dtype=torch.long, device=device)
-                true_px, better_px, tied_px = {}, {}, {}
-                for pb in prefix_bits:
-                    true_px[pb] = (q_lv[:, :pb]
-                                   == doc_levels[true_idx][:, :pb]).sum(dim=-1)
-                    better_px[pb] = torch.zeros(b, dtype=torch.long, device=device)
-                    tied_px[pb] = torch.zeros(b, dtype=torch.long, device=device)
             for s in range(0, n_docs, doc_chunk):
                 block = doc_indices[s : s + doc_chunk]  # (C, P)
                 # A document is never counted against itself.
@@ -140,10 +128,6 @@ def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
                     ov_pd = eq_pd.sum(dim=-1)
                     better_pd += ((ov_pd > true_pd.unsqueeze(1)) & ~is_self).sum(dim=1)
                     tied_pd += ((ov_pd == true_pd.unsqueeze(1)) & ~is_self).sum(dim=1)
-                    for pb in prefix_bits:
-                        ov_px = eq_pd[:, :, :pb].sum(dim=-1)
-                        better_px[pb] += ((ov_px > true_px[pb].unsqueeze(1)) & ~is_self).sum(dim=1)
-                        tied_px[pb] += ((ov_px == true_px[pb].unsqueeze(1)) & ~is_self).sum(dim=1)
             # rank: ties placed first. rank_exp: ties at their expected position.
             rank = (better + 1).float()
             rank_exp = (better + 1 + tied / 2.0).float()
@@ -174,10 +158,6 @@ def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
                 pd_recall1.extend((rk <= 1).float().cpu().tolist())
                 pd_recall10.extend((rk <= 10).float().cpu().tolist())
                 pd_tied.extend(tied_pd.float().cpu().tolist())
-                for pb in prefix_bits:
-                    rk_px = (better_px[pb] + 1 + tied_px[pb] / 2.0).float()
-                    px_rr[pb].extend((1.0 / rk_px).cpu().tolist())
-                    px_tied[pb].extend(tied_px[pb].float().cpu().tolist())
 
     # Mean over all queries, gathered from every GPU, without the padding.
     def mean(v):
@@ -214,7 +194,4 @@ def compute_mrr(model, queries, true_doc_idx, doc_texts, batch_size, device,
         "code_usage":     code_usage,
         "code_ppl":       code_perplexity,
     }
-    for pb in (prefix_bits if doc_levels is not None else ()):
-        out[f"prefix_mrr@{pb}"] = mean(px_rr[pb]) if px_rr[pb] else float("nan")
-        out[f"prefix_tied@{pb}"] = mean(px_tied[pb]) if px_tied[pb] else float("nan")
     return out

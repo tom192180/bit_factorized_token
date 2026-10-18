@@ -3,7 +3,7 @@
 Notation follows the paper: T tokens of m bits, k = T*m bits, 2^m token values; C holds the
 tokens c_1..c_T of every document, P the table of token bit patterns p_v, u_q = w * z_q.
 
-Two kinds of rows are printed:
+Two rows are printed (beam width and number of trees from config.py, or --beam / --trees):
     beam <b>              one prefix tree, beam width b
     MULTI h=<h> beam <b>  h prefix trees over permuted bit orders each propose candidates,
                           which are then ranked by the full score s(q, d) = b_d . u_q
@@ -21,7 +21,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.dirname(HERE)
-for _p in (_SRC, os.path.join(_SRC, "docid_encoder"), os.path.join(_SRC, "retriever"), HERE):
+for _p in (_SRC, os.path.join(_SRC, "docid_encoder"), os.path.join(_SRC, "retriever"), HERE):  # HERE first
     if _p in sys.path:
         sys.path.remove(_p)
     sys.path.insert(0, _p)
@@ -29,8 +29,7 @@ from head import BitWeights                               # noqa: E402
 from trie import root_children                            # noqa: E402
 from corpus import doc_ids_texts, load_queries, DATASETS  # noqa: E402
 from checkpoint import load_encoder                       # noqa: E402
-
-CUTOFFS = (1, 5, 10, 20, 100)  # Hit@n cutoffs; MRR is computed up to the largest
+from config import BEAM, TREES, PERM_SEED, CUTOFFS, ENCODE_BATCH  # noqa: E402
 
 
 def _spans(lo, hi):
@@ -45,9 +44,17 @@ def _first_relevant(scs, rows, gold, gid, shared):
     """Tie-aware rank of the first relevant document among the scored `rows`.
 
     Returns (ranks, probabilities): the possible ranks and how likely each is when tied
-    documents are ordered at random. None if no relevant document was retrieved."""
+    documents are ordered at random. None if no relevant document was retrieved.
+
+    The relevant document with the best score lies in a block of n_tie documents that share
+    that score, after `a` documents that score strictly higher; g of the block are relevant.
+    Under a random order of the block, the first relevant one is at block position x with
+
+        P(x) = C(n_tie - x, g - 1) / C(n_tie, g),     x = 1 .. n_tie - g + 1,
+
+    (all positions before x non-relevant, x relevant), i.e. at rank a + x."""
     if not len(rows):
-        return None
+        return None  # nothing retrieved: the query counts 0 (see _metrics)
     scs = np.asarray(scs, dtype=np.float64)
     sh = shared[rows]
     if sh.any():
@@ -61,18 +68,23 @@ def _first_relevant(scs, rows, gold, gid, shared):
     s, isg = scs[o], np.isin(rows[o], list(gold))
     hit = np.flatnonzero(isg)
     if not len(hit):
-        return None
+        return None  # none of the relevant documents retrieved: the query counts 0
     a = int(np.searchsorted(-s, -s[hit[0]], side="left"))  # strictly better documents
     b = int(np.searchsorted(-s, -s[hit[0]], side="right"))  # end of the tied block
     n_tie, g = b - a, int(isg[a:b].sum())  # tied documents, of which g are relevant
-    j = np.arange(1, n_tie - g + 2)
+    j = np.arange(1, n_tie - g + 2)  # block positions x of the first relevant document
     p = np.array([math.comb(n_tie - x, g - 1) for x in j], dtype=np.float64) / math.comb(n_tie, g)
-    return a + j, p
+    return a + j, p  # ranks a + x and P(x); no ties is n_tie = g = 1: rank a + 1, P = 1
 
 
 def _metrics(ranks, cands):
-    """Hit@n, MRR@100 and MRR@10 as expectations over the tie-aware ranks."""
-    nq = len(ranks)
+    """Hit@n, MRR@100 and MRR@10 as expectations over the tie-aware ranks.
+
+    With (r_x, P(x)) from _first_relevant for query q, averaged over all N queries:
+        Hit@n = 1/N sum_q sum_x P(x) [r_x <= n]
+        MRR@n = 1/N sum_q sum_x P(x) [r_x <= n] / r_x
+    A query without a relevant document retrieved (None) adds 0 but still counts in N."""
+    nq = len(ranks)  # N: every query, including the None ones
     hits = [d for d in ranks if d is not None]
     res = {f"@{n}": float(sum(p[r <= n].sum() for r, p in hits)) / nq for n in CUTOFFS}
     res["MRR"] = float(sum((p * np.where(r <= max(CUTOFFS), 1.0 / r, 0.0)).sum() for r, p in hits)) / nq
@@ -96,17 +108,13 @@ def main():
                     help="which <name>_queries.tsv of the split to score")
     ap.add_argument("--restrict", default="",
                     help="file of docids, one per line: index only these documents")
-    ap.add_argument("--beam", type=int, default=100, help="beam width of the single-tree row")
-    ap.add_argument("--multi", default="8:100",
-                    help="multi-tree rows as h:beam pairs (h trees), e.g. '8:100,4:100'")
-    ap.add_argument("--eval_n", type=int, default=-1, help="query-document pairs to use (-1 = all)")
     ap.add_argument("--max_seq_length", type=int, default=128)
-    ap.add_argument("--bs", type=int, default=256)
-    ap.add_argument("--seed", type=int, default=0, help="seed of the bit permutations")
+    ap.add_argument("--beam", type=int, default=BEAM, help=f"beam width (default {BEAM})")
+    ap.add_argument("--trees", type=int, default=TREES,
+                    help=f"number of permuted trees h for the MULTI row (default {TREES}; 1 = none)")
     a = ap.parse_args()
     if not a.stage1_only and not a.stage1:
         raise SystemExit("--stage1 <DocID encoder checkpoint> is required unless --stage1_only")
-    multi = [tuple(int(x) for x in p.split(":")) for p in a.multi.split(",")] if a.multi else []
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     # DocIDs: C (n_docs, T), row d = the tokens c_1..c_T of document d, each in [0, 2^m).
@@ -185,8 +193,6 @@ def main():
               + ("" if want else "  [checkpoint records no split: not verified]"), flush=True)
     else:
         dv = load_queries(a.dataset, a.split, ids)
-    if a.eval_n > 0:
-        dv = dv[:a.eval_n]
     by_query = {}
     for text, g in dv:
         by_query.setdefault(text, []).append(g)
@@ -196,20 +202,19 @@ def main():
           flush=True)
 
     # Prefix trees. Tree 0 uses the bits in their original order; each other tree permutes the
-    # k bits (pi) and regroups them into T tokens. A tree is (pi, its tokens sorted, row ->
+    # k bits (pi) and regroups them into T tokens. tree_list[i] = (pi, its tokens sorted, row ->
     # document index, root children).
     B01 = ((C[:, :, None] >> np.arange(m)) & 1).reshape(len(C), k)  # b_d as 0/1 bits
-    rng = np.random.default_rng(a.seed)
-    h_max = max([h for h, _ in multi], default=1)
-    PERMS = [np.arange(k)] + [rng.permutation(k) for _ in range(h_max - 1)]
-    TREES = []
+    rng = np.random.default_rng(PERM_SEED)
+    PERMS = [np.arange(k)] + [rng.permutation(k) for _ in range(a.trees - 1)]
+    tree_list = []
     for pi in PERMS:
         B01_pi = B01[:, pi]
         C_pi = np.zeros((len(B01_pi), T), dtype=np.int64)  # tokens under this bit order
         for t in range(T):
             C_pi[:, t] = (B01_pi[:, t * m:(t + 1) * m] * (1 << np.arange(m))).sum(1)
         o = np.lexsort([C_pi[:, t] for t in range(T - 1, -1, -1)])
-        TREES.append((pi, C_pi[o], o) + root_children(C_pi[o]))
+        tree_list.append((pi, C_pi[o], o) + root_children(C_pi[o]))
 
     # Rows of tree 0 are the reference order: `back` maps a document index to its row.
     order = np.lexsort([C[:, t] for t in range(T - 1, -1, -1)])
@@ -225,8 +230,8 @@ def main():
           f"{int((gcnt > 1).sum()):,} groups (max {int(gcnt.max())})", flush=True)
 
     with torch.no_grad():
-        Zq = torch.cat([model(texts[i:i + a.bs])[1].float()
-                        for i in range(0, len(texts), a.bs)])  # z_q of every query
+        Zq = torch.cat([model(texts[i:i + ENCODE_BATCH])[1].float()
+                        for i in range(0, len(texts), ENCODE_BATCH)])  # z_q of every query
 
     @torch.no_grad()
     def token_logprobs(z_q):
@@ -291,7 +296,7 @@ def main():
         for qi in range(len(Zq)):
             z_q = Zq[qi].cpu().numpy()
             cand = set()
-            for pi, C_sorted, row2doc, rv_p, rs_p, re_p in TREES[:h]:
+            for pi, C_sorted, row2doc, rv_p, rs_p, re_p in tree_list[:h]:
                 u_pi = (z_q * w)[pi]  # u_q with its bits in this tree's order
                 logp = []  # log p_t(v | q) per position t
                 for t in range(T):
@@ -339,9 +344,9 @@ def main():
 
     t0 = time.time(); res = run_single(a.beam)
     row(f"beam {a.beam}", res, time.time() - t0)
-    for h, b in multi:
-        t0 = time.time(); res = run_multi(b, h)
-        row(f"MULTI h={h} beam {b}", res, time.time() - t0)
+    if a.trees > 1:
+        t0 = time.time(); res = run_multi(a.beam, a.trees)
+        row(f"MULTI h={a.trees} beam {a.beam}", res, time.time() - t0)
 
 
 if __name__ == "__main__":

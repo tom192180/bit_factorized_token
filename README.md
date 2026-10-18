@@ -53,6 +53,9 @@ Every launcher takes a dataset and a setting:
 In a seen/unseen setting, training uses the seen documents only; the unseen documents receive
 their DocIDs from the trained encoder and are evaluated without any further training.
 
+Defaults are the paper's main setting: BERT-base, 120-bit DocIDs (10 tokens x 12 bits), inputs
+of 128 tokens; only the dataset and the setting need to be chosen.
+
 ```bash
 D=nq320k; S=seen60_unseen40
 

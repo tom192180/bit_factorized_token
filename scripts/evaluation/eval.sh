@@ -32,8 +32,7 @@ run () {   # $1 model name   $2 checkpoint   $3.. extra flags
     fi
     echo; echo "########## $DATASET $SETTING | $name | $s ##########"
     "$PYTHON" "$SRC/evaluation/eval_retrieval.py" --dataset "$DATASET" --ckpt "$ck" --enc "$DOCIDS" \
-        --split "$TEST" "${extra[@]}" --max_seq_length "$MAXLEN" \
-        --beam 100 --multi 8:100 "$@" \
+        --split "$TEST" "${extra[@]}" --max_seq_length "$MAXLEN" "$@" \
         2>&1 | tee "$OUT/eval/${name}_${s}_$(date +%Y%m%d_%H%M%S).log"
   done
 }

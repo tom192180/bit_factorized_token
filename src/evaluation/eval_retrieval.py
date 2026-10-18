@@ -1,8 +1,11 @@
 """Evaluate a DocID encoder or a retriever with constrained beam search, tie-aware.
 
+Notation follows the paper: T tokens of m bits, k = T*m bits, 2^m token values; C holds the
+tokens c_1..c_T of every document, P the table of token bit patterns p_v, u_q = w * z_q.
+
 Two kinds of rows are printed:
     beam <b>              one prefix tree, beam width b
-    MULTI k=<k> beam <b>  k prefix trees over permuted bit orders each propose candidates,
+    MULTI h=<h> beam <b>  h prefix trees over permuted bit orders each propose candidates,
                           which are then ranked by the full score s(q, d) = b_d . u_q
 
 Documents that share a DocID get the same score. They are scored tie-aware: a metric is its
@@ -27,7 +30,7 @@ from trie import root_children                            # noqa: E402
 from corpus import doc_ids_texts, load_queries, DATASETS  # noqa: E402
 from checkpoint import load_encoder                       # noqa: E402
 
-KS = (1, 5, 10, 20, 100)
+CUTOFFS = (1, 5, 10, 20, 100)  # Hit@n cutoffs; MRR is computed up to the largest
 
 
 def _spans(lo, hi):
@@ -52,8 +55,8 @@ def _first_relevant(scs, rows, gold, gid, shared):
         scs = scs.copy()
         g_r = gid[rows]
         for gg in np.unique(g_r[sh]):
-            m = g_r == gg
-            scs[m] = scs[m].max()
+            same = g_r == gg
+            scs[same] = scs[same].max()
     o = np.argsort(-scs, kind="stable")
     s, isg = scs[o], np.isin(rows[o], list(gold))
     hit = np.flatnonzero(isg)
@@ -61,21 +64,21 @@ def _first_relevant(scs, rows, gold, gid, shared):
         return None
     a = int(np.searchsorted(-s, -s[hit[0]], side="left"))  # strictly better documents
     b = int(np.searchsorted(-s, -s[hit[0]], side="right"))  # end of the tied block
-    k, g = b - a, int(isg[a:b].sum())
-    j = np.arange(1, k - g + 2)
-    p = np.array([math.comb(k - x, g - 1) for x in j], dtype=np.float64) / math.comb(k, g)
+    n_tie, g = b - a, int(isg[a:b].sum())  # tied documents, of which g are relevant
+    j = np.arange(1, n_tie - g + 2)
+    p = np.array([math.comb(n_tie - x, g - 1) for x in j], dtype=np.float64) / math.comb(n_tie, g)
     return a + j, p
 
 
 def _metrics(ranks, cands):
-    """Hit@k, MRR@100 and MRR@10 as expectations over the tie-aware ranks."""
-    n = len(ranks)
+    """Hit@n, MRR@100 and MRR@10 as expectations over the tie-aware ranks."""
+    nq = len(ranks)
     hits = [d for d in ranks if d is not None]
-    m = {f"@{k}": float(sum(p[r <= k].sum() for r, p in hits)) / n for k in KS}
-    m["MRR"] = float(sum((p * np.where(r <= max(KS), 1.0 / r, 0.0)).sum() for r, p in hits)) / n
-    m["MRR@10"] = float(sum((p * np.where(r <= 10, 1.0 / r, 0.0)).sum() for r, p in hits)) / n
-    m["cands"] = float(np.mean(cands))  # documents scored per query
-    return m
+    res = {f"@{n}": float(sum(p[r <= n].sum() for r, p in hits)) / nq for n in CUTOFFS}
+    res["MRR"] = float(sum((p * np.where(r <= max(CUTOFFS), 1.0 / r, 0.0)).sum() for r, p in hits)) / nq
+    res["MRR@10"] = float(sum((p * np.where(r <= 10, 1.0 / r, 0.0)).sum() for r, p in hits)) / nq
+    res["cands"] = float(np.mean(cands))  # documents scored per query
+    return res
 
 
 def main():
@@ -94,7 +97,8 @@ def main():
     ap.add_argument("--restrict", default="",
                     help="file of docids, one per line: index only these documents")
     ap.add_argument("--beam", type=int, default=100, help="beam width of the single-tree row")
-    ap.add_argument("--multi", default="8:100", help="multi-tree rows as k:beam pairs, e.g. '8:100,4:100'")
+    ap.add_argument("--multi", default="8:100",
+                    help="multi-tree rows as h:beam pairs (h trees), e.g. '8:100,4:100'")
     ap.add_argument("--eval_n", type=int, default=-1, help="query-document pairs to use (-1 = all)")
     ap.add_argument("--max_seq_length", type=int, default=128)
     ap.add_argument("--bs", type=int, default=256)
@@ -105,34 +109,34 @@ def main():
     multi = [tuple(int(x) for x in p.split(":")) for p in a.multi.split(",")] if a.multi else []
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # DocIDs: codes (n_docs, T) tokens of B bits.
+    # DocIDs: C (n_docs, T), row d = the tokens c_1..c_T of document d, each in [0, 2^m).
     d = np.load(a.enc)
-    T, kary = int(d["n_tok"]), int(d["kary"]); B = int(round(math.log2(kary)))
-    n_bits = T * B
-    codes = d["doc_codes"].astype(np.int64)
-    # S[v] = token v as +-1 bits, so (u_t @ S.T)[v] is the logit of token v.
-    S = (((torch.arange(kary)[:, None] >> torch.arange(B)) & 1) * 2 - 1).float().to(dev)
-    Snp = S.cpu().numpy()
+    T, V = int(d["n_tok"]), int(d["kary"]); m = int(round(math.log2(V)))  # V = 2^m
+    k = T * m
+    C = d["doc_codes"].astype(np.int64)
+    # P (2^m, m): row v = p_v, the bits of token value v as +-1; (P @ u_t)[v] = p_v . u_t.
+    P = (((torch.arange(V)[:, None] >> torch.arange(m)) & 1) * 2 - 1).float().to(dev)
+    P_np = P.cpu().numpy()
 
     print(f"[eval] {os.path.basename(a.ckpt)}  dataset={a.dataset}  split={a.split}")
-    head = BitWeights(n_bits).to(dev)  # all ones for a DocID encoder
+    head = BitWeights(k).to(dev)  # w; all ones for a DocID encoder
     if a.stage1_only:
-        model, nt, kk, _, _ = load_encoder(a.ckpt, None, a.max_seq_length)
+        model, T_ck, V_ck, _, _ = load_encoder(a.ckpt, None, a.max_seq_length)
     else:
         blob = torch.load(a.ckpt, map_location="cpu")
         print(f"[eval] step {blob['step']:,} | validation " +
-              "  ".join(f"{k} {v:.4f}" for k, v in blob["dev"].items()), flush=True)
-        model, nt, kk, _, _ = load_encoder(a.stage1, None, a.max_seq_length)
+              "  ".join(f"{name} {val:.4f}" for name, val in blob["dev"].items()), flush=True)
+        model, T_ck, V_ck, _, _ = load_encoder(a.stage1, None, a.max_seq_length)
         model.load_state_dict(blob["enc"])
         if set(blob["head"]) != {"zs"}:
             raise SystemExit(f"{a.ckpt} does not hold per-bit weights only")
         head.load_state_dict(blob["head"])
-    assert nt == T and kk == kary, f"checkpoint is {nt}x{kk}, {a.enc} is {T}x{kary}"
+    assert T_ck == T and V_ck == V, f"checkpoint is {T_ck}x{V_ck}, {a.enc} is {T}x{V}"
     model = model.to(dev).eval(); head.eval()
 
     ids, _ = doc_ids_texts(a.dataset)
-    assert len(ids) == len(codes), (
-        f"{len(ids):,} documents in the corpus but {len(codes):,} rows in {a.enc}")
+    assert len(ids) == len(C), (
+        f"{len(ids):,} documents in the corpus but {len(C):,} rows in {a.enc}")
     if a.restrict:
         with open(a.restrict, encoding="utf-8") as fh:
             keep = {l.split("\t")[0].strip() for l in fh if l.strip()}
@@ -140,7 +144,7 @@ def main():
         if len(sel) != len(keep):
             raise SystemExit(f"--restrict lists {len(keep)-len(sel):,} docids not in the corpus")
         ids = [ids[i] for i in sel]
-        codes = codes[sel]
+        C = C[sel]
         print(f"[eval] index restricted to {len(ids):,} documents "
               f"({os.path.basename(a.restrict)})", flush=True)
 
@@ -184,64 +188,65 @@ def main():
     if a.eval_n > 0:
         dv = dv[:a.eval_n]
     by_query = {}
-    for t, g in dv:
-        by_query.setdefault(t, []).append(g)
+    for text, g in dv:
+        by_query.setdefault(text, []).append(g)
     texts = list(by_query)
-    dgolds = [by_query[t] for t in texts]
+    dgolds = [by_query[text] for text in texts]
     print(f"[eval] {len(ids):,} documents | {len(dv):,} pairs over {len(texts):,} queries",
           flush=True)
 
     # Prefix trees. Tree 0 uses the bits in their original order; each other tree permutes the
-    # bits and regroups them into tokens. A tree is (permutation, sorted tokens, row -> document
-    # index, root children).
-    dbits = ((codes[:, :, None] >> np.arange(B)) & 1).reshape(len(codes), n_bits)
+    # k bits (pi) and regroups them into T tokens. A tree is (pi, its tokens sorted, row ->
+    # document index, root children).
+    B01 = ((C[:, :, None] >> np.arange(m)) & 1).reshape(len(C), k)  # b_d as 0/1 bits
     rng = np.random.default_rng(a.seed)
-    n_trees = max([k for k, _ in multi], default=1)
-    PERMS = [np.arange(n_bits)] + [rng.permutation(n_bits) for _ in range(n_trees - 1)]
+    h_max = max([h for h, _ in multi], default=1)
+    PERMS = [np.arange(k)] + [rng.permutation(k) for _ in range(h_max - 1)]
     TREES = []
     for pi in PERMS:
-        cb = dbits[:, pi]
-        cc = np.zeros((len(cb), T), dtype=np.int64)
+        B01_pi = B01[:, pi]
+        C_pi = np.zeros((len(B01_pi), T), dtype=np.int64)  # tokens under this bit order
         for t in range(T):
-            cc[:, t] = (cb[:, t * B:(t + 1) * B] * (1 << np.arange(B))).sum(1)
-        o = np.lexsort([cc[:, t] for t in range(T - 1, -1, -1)])
-        TREES.append((pi, cc[o], o) + root_children(cc[o]))
+            C_pi[:, t] = (B01_pi[:, t * m:(t + 1) * m] * (1 << np.arange(m))).sum(1)
+        o = np.lexsort([C_pi[:, t] for t in range(T - 1, -1, -1)])
+        TREES.append((pi, C_pi[o], o) + root_children(C_pi[o]))
 
     # Rows of tree 0 are the reference order: `back` maps a document index to its row.
-    order = np.lexsort([codes[:, t] for t in range(T - 1, -1, -1)])
-    Cs_np = codes[order]; back = np.argsort(order)
-    ROOT_VALS, ROOT_ST, ROOT_EN = root_children(Cs_np)
+    order = np.lexsort([C[:, t] for t in range(T - 1, -1, -1)])
+    C_tree = C[order]; back = np.argsort(order)
+    ROOT_VALS, ROOT_ST, ROOT_EN = root_children(C_tree)
     gold_rows = [set(back[np.array(g)].tolist()) for g in dgolds]
 
     # Documents sharing a DocID: GID = group of each row, SHARED = the group has several rows.
-    _, gid, gcnt = np.unique(Cs_np, axis=0, return_inverse=True, return_counts=True)
+    _, gid, gcnt = np.unique(C_tree, axis=0, return_inverse=True, return_counts=True)
     GID = np.asarray(gid).ravel()
     SHARED = gcnt[GID] > 1
     print(f"[eval] shared DocIDs: {int(SHARED.sum()):,} documents in "
           f"{int((gcnt > 1).sum()):,} groups (max {int(gcnt.max())})", flush=True)
 
     with torch.no_grad():
-        Z = torch.cat([model(texts[i:i + a.bs])[1].float()
-                       for i in range(0, len(texts), a.bs)])
+        Zq = torch.cat([model(texts[i:i + a.bs])[1].float()
+                        for i in range(0, len(texts), a.bs)])  # z_q of every query
 
     @torch.no_grad()
-    def token_logprobs(z):
-        """(T, kary): log-probability of every token at every position, for one query."""
-        return torch.log_softmax(head(z).view(T, B) @ S.T, dim=-1)
+    def token_logprobs(z_q):
+        """(T, 2^m): log p_t(v | q) = p_v . u_t - R_t(q) for every position t and value v."""
+        return torch.log_softmax(head(z_q).view(T, m) @ P.T, dim=-1)
 
     @torch.no_grad()
-    def score(z, rows):
-        """Full score of the documents at `rows`: their summed token log-probabilities."""
+    def score(z_q, rows):
+        """Full score of the documents at `rows`: their summed token log-probabilities,
+        s(q, d) - R(q) (Eq. 9), which ranks like s(q, d)."""
         if len(rows) == 0:
             return np.zeros(0, dtype=np.float32)
-        tgt = torch.from_numpy(Cs_np[rows]).to(dev)  # (n, T) tokens
-        return token_logprobs(z)[torch.arange(T, device=dev)[None, :], tgt].sum(1).cpu().numpy()
+        tgt = torch.from_numpy(C_tree[rows]).to(dev)  # (n, T) tokens
+        return token_logprobs(z_q)[torch.arange(T, device=dev)[None, :], tgt].sum(1).cpu().numpy()
 
-    def expand(Cs, lo, hi, t):
+    def expand(C_sorted, lo, hi, t):
         """Children at depth t of the tree nodes [lo, hi): (token, start, end, parent)."""
         vl, sl, el, pl = [], [], [], []
         for j in range(len(lo)):
-            col = Cs[lo[j]:hi[j], t]
+            col = C_sorted[lo[j]:hi[j], t]
             idx = np.flatnonzero(np.concatenate(([True], col[1:] != col[:-1])))
             st = lo[j] + idx
             vl.append(col[idx]); sl.append(st)
@@ -252,13 +257,13 @@ def main():
 
     def run_single(beam):
         """Beam search over tree 0; the retrieved documents keep their beam scores."""
-        ranks = [None] * len(Z)
-        ncand = np.zeros(len(Z), dtype=np.float64)
-        for qi in range(len(Z)):
-            tok = token_logprobs(Z[qi]).cpu().numpy()
+        ranks = [None] * len(Zq)
+        ncand = np.zeros(len(Zq), dtype=np.float64)
+        for qi in range(len(Zq)):
+            logp = token_logprobs(Zq[qi]).cpu().numpy()
             sc = np.zeros(1, dtype=np.float32)
             lo = np.zeros(1, dtype=np.int64)
-            hi = np.full(1, len(Cs_np), dtype=np.int64)
+            hi = np.full(1, len(C_tree), dtype=np.int64)
             for t in range(T):
                 if len(lo) == 0:
                     break
@@ -266,8 +271,8 @@ def main():
                     vals, st, en = ROOT_VALS, ROOT_ST, ROOT_EN
                     par = np.zeros(len(vals), dtype=np.int64)
                 else:
-                    vals, st, en, par = expand(Cs_np, lo, hi, t)
-                sc = sc[par] + tok[t, vals]
+                    vals, st, en, par = expand(C_tree, lo, hi, t)
+                sc = sc[par] + logp[t, vals]
                 lo, hi = st, en
                 if len(sc) > beam:
                     keep = np.argpartition(-sc, beam)[:beam]
@@ -278,24 +283,24 @@ def main():
             ncand[qi] = len(rows)
         return _metrics(ranks, ncand)
 
-    def run_multi(beam, k):
-        """Beam search over k trees; the union of their documents is ranked by the full score."""
-        zs_np = head.zs.detach().cpu().numpy()
-        ranks = [None] * len(Z)
-        ncand = np.zeros(len(Z), dtype=np.float64)
-        for qi in range(len(Z)):
-            zq = Z[qi].cpu().numpy()
+    def run_multi(beam, h):
+        """Beam search over h trees; the union of their documents is ranked by the full score."""
+        w = head.zs.detach().cpu().numpy()
+        ranks = [None] * len(Zq)
+        ncand = np.zeros(len(Zq), dtype=np.float64)
+        for qi in range(len(Zq)):
+            z_q = Zq[qi].cpu().numpy()
             cand = set()
-            for pi, Cs_p, row2doc, rv_p, rs_p, re_p in TREES[:k]:
-                g = (zq * zs_np)[pi]  # u_q with its bits in this tree's order
-                lp = []  # token log-probabilities per position
+            for pi, C_sorted, row2doc, rv_p, rs_p, re_p in TREES[:h]:
+                u_pi = (z_q * w)[pi]  # u_q with its bits in this tree's order
+                logp = []  # log p_t(v | q) per position t
                 for t in range(T):
-                    lo_ = Snp @ g[t * B:(t + 1) * B]
-                    m = lo_.max()
-                    lp.append(lo_ - (m + np.log(np.exp(lo_ - m).sum())))
+                    raw = P_np @ u_pi[t * m:(t + 1) * m]  # p_v . u_t for every v
+                    mx = raw.max()
+                    logp.append(raw - (mx + np.log(np.exp(raw - mx).sum())))
                 sc = np.zeros(1, dtype=np.float32)
                 lo = np.zeros(1, dtype=np.int64)
-                hi = np.full(1, len(Cs_p), dtype=np.int64)
+                hi = np.full(1, len(C_sorted), dtype=np.int64)
                 for t in range(T):
                     if len(lo) == 0:
                         break
@@ -303,8 +308,8 @@ def main():
                         vals, st, en = rv_p, rs_p, re_p
                         par = np.zeros(len(vals), dtype=np.int64)
                     else:
-                        vals, st, en, par = expand(Cs_p, lo, hi, t)
-                    sc = sc[par] + lp[t][vals]
+                        vals, st, en, par = expand(C_sorted, lo, hi, t)
+                    sc = sc[par] + logp[t][vals]
                     lo, hi = st, en
                     if len(sc) > beam:
                         keep = np.argpartition(-sc, beam)[:beam]
@@ -317,26 +322,26 @@ def main():
                         sc, lo, hi = sc[keep], lo[keep], hi[keep]
                 cand.update(row2doc[_spans(lo, hi)].tolist())
             rows = back[np.fromiter(cand, dtype=np.int64, count=len(cand))]
-            ranks[qi] = _first_relevant(score(Z[qi], rows), rows, gold_rows[qi], GID, SHARED)
+            ranks[qi] = _first_relevant(score(Zq[qi], rows), rows, gold_rows[qi], GID, SHARED)
             ncand[qi] = len(rows)
         return _metrics(ranks, ncand)
 
-    hdr = "  {:<22}".format("config") + "".join(f"{'@'+str(k):>7}" for k in KS) + \
+    hdr = "  {:<22}".format("config") + "".join(f"{'@'+str(n):>7}" for n in CUTOFFS) + \
           f"{'MRR':>8}{'cands':>8}{'sec':>7}{'ms/q':>8}"
     print("\n" + hdr)
     print("  " + "-" * (len(hdr) - 2), flush=True)
 
-    def row(name, m, dt):
-        cells = "".join(f"{m[f'@{k}']*100:7.2f}" for k in KS)
-        print(f"  {name:<22}{cells}{m['MRR']*100:8.2f}{m['cands']:8.0f}{dt:7.0f}"
-              f"{dt / max(1, len(texts)) * 1000:8.1f}   | MRR@10 {m['MRR@10']*100:.2f}",
+    def row(name, res, dt):
+        cells = "".join(f"{res[f'@{n}']*100:7.2f}" for n in CUTOFFS)
+        print(f"  {name:<22}{cells}{res['MRR']*100:8.2f}{res['cands']:8.0f}{dt:7.0f}"
+              f"{dt / max(1, len(texts)) * 1000:8.1f}   | MRR@10 {res['MRR@10']*100:.2f}",
               flush=True)
 
-    t0 = time.time(); m = run_single(a.beam)
-    row(f"beam {a.beam}", m, time.time() - t0)
-    for k, b in multi:
-        t0 = time.time(); m = run_multi(b, k)
-        row(f"MULTI k={k} beam {b}", m, time.time() - t0)
+    t0 = time.time(); res = run_single(a.beam)
+    row(f"beam {a.beam}", res, time.time() - t0)
+    for h, b in multi:
+        t0 = time.time(); res = run_multi(b, h)
+        row(f"MULTI h={h} beam {b}", res, time.time() - t0)
 
 
 if __name__ == "__main__":
